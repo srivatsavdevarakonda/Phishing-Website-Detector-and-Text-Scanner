@@ -3,265 +3,273 @@ import requests
 import socket
 import whois
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from datetime import datetime
-import concurrent.futures
 import time
 import ssl
 from OpenSSL import crypto
+import json
+import os
 
-# --- INTELLIGENT ANALYSIS ENGINE ---
+# --- CONFIGURATION & SETUP ---
+# Use a session state to cache the local threat database to avoid reloading from disk on every interaction.
+if 'local_threat_db' not in st.session_state:
+    st.session_state.local_threat_db = set()
 
-def levenshtein_distance(s1, s2):
-    """Calculates the Levenshtein distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-
-    if len(s2) == 0:
-        return len(s1)
-
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-
-    return previous_row[-1]
-
-def check_typosquatting(hostname):
+# --- LOCAL THREAT INTELLIGENCE DATABASE ---
+def load_local_threat_db():
     """
-    Performs an intelligent typosquatting check using Levenshtein distance.
+    Loads a local phishing URL database from a JSON file.
+    This approach avoids real-time API calls and their rate-limiting issues.
     """
-    legitimate_domains = [
-        "microsoft.com", "google.com", "apple.com", "paypal.com",
-        "amazon.com", "facebook.com", "instagram.com", "netflix.com",
-        "bankofamerica.com", "chase.com", "wellsfargo.com"
-    ]
+    if st.session_state.local_threat_db: # Don't reload if already loaded
+        return
+
+    db_file = 'local_phishtank_db.json'
     
-    # Remove TLD like .com, .org for a cleaner comparison
-    hostname_base = '.'.join(hostname.split('.')[:-1])
+    # For demonstration, we create a sample DB if it doesn't exist.
+    # INSTRUCTIONS FOR YOUR PROJECT:
+    # 1. Download the full database from http://data.phishtank.com/data/online-valid.json
+    # 2. Save it in the same directory as your script with the name 'local_phishtank_db.json'
+    # 3. The script will then use your comprehensive local file instead of this small sample.
+    if not os.path.exists(db_file):
+        st.info("Local threat database not found. Creating a sample database for demonstration.")
+        sample_db = [
+            {"url": "http://paypal.com.security-check.info/login"},
+            {"url": "http://micros0ft.com/update-account"},
+            {"url": "http://chase-bank-verify.xyz/secure"}
+        ]
+        # We only need the URLs for our set
+        url_list = [item['url'] for item in sample_db]
+        with open(db_file, 'w') as f:
+            json.dump(url_list, f)
     
-    for legit_domain in legitimate_domains:
-        legit_base = '.'.join(legit_domain.split('.')[:-1])
-        distance = levenshtein_distance(hostname_base, legit_base)
-        
-        # If the domains are not identical, but the distance is very small, it's a red flag.
-        if 0 < distance <= 2:
-            return f"Warning: '{hostname}' is suspiciously similar to '{legit_domain}' (edit distance: {distance})."
-            
-    return "No lookalike or typosquatting detected for popular brands."
-
-
-def get_ssl_certificate_info(hostname):
-    """Fetches and parses the real SSL certificate for a given hostname."""
     try:
-        cert_pem = ssl.get_server_certificate((hostname, 443))
-        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_pem)
-        issuer_components = dict(cert.get_issuer().get_components())
-        valid_from_str = cert.get_notBefore().decode('ascii')
-        valid_to_str = cert.get_notAfter().decode('ascii')
-        return {
-            "issuer": issuer_components.get(b'O', b'N/A').decode(),
-            "valid_from": datetime.strptime(valid_from_str, '%Y%m%d%H%M%SZ'),
-            "valid_to": datetime.strptime(valid_to_str, '%Y%m%d%H%M%SZ'),
-            "error": None
-        }
-    except Exception as e:
-        return {"error": f"SSL cert fetch failed: {e}"}
+        with open(db_file, 'r') as f:
+            urls = json.load(f)
+            # If the file is from PhishTank, it's a list of dicts. If it's our simplified one, it's a list of strings.
+            if urls and isinstance(urls[0], dict):
+                 st.session_state.local_threat_db = {item['url'] for item in urls}
+            else:
+                 st.session_state.local_threat_db = set(urls)
+        st.success(f"Loaded {len(st.session_state.local_threat_db)} threats from local database.")
+    except (IOError, json.JSONDecodeError) as e:
+        st.error(f"Error loading local threat database: {e}")
+        st.session_state.local_threat_db = set()
 
-def get_technical_details(url):
-    """Gathers various technical details about the URL using real-time checks."""
-    details = {"url": url}
+# --- CORE ANALYSIS ENGINE ---
+
+def expand_shortened_url(url):
+    """Follows redirects to find the final destination of a shortened URL."""
     try:
-        parsed_url = urlparse(url)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        with requests.Session() as session:
+            response = session.get(url, headers=headers, timeout=10, allow_redirects=True)
+            return response.url
+    except requests.RequestException:
+        return url
+
+def get_domain_age_days(hostname):
+    """Gets the age of a domain in days."""
+    try:
+        domain_info = whois.whois(hostname)
+        creation_date = domain_info.creation_date
+        if isinstance(creation_date, list):
+            creation_date = creation_date[0]
+        if creation_date:
+            return (datetime.now() - creation_date).days
+    except Exception:
+        return None
+
+def analyze_url(url):
+    """Performs a comprehensive analysis of a single URL and returns a score and report."""
+    report = []
+    score = 0
+
+    final_url = expand_shortened_url(url)
+    if final_url != url:
+        report.append(f"⚠️ **Redirect Detected:** URL redirects to `{final_url}`. Analyzing final destination.")
+        score += 10
+
+    if final_url in st.session_state.local_threat_db:
+        report.append("🚨 **CRITICAL:** URL found in the local phishing threat database.")
+        score += 90
+
+    try:
+        parsed_url = urlparse(final_url)
         hostname = parsed_url.hostname
-        if not hostname: return {"error": "Could not parse hostname from URL."}
-        details['hostname'] = hostname
-        details['uses_https'] = parsed_url.scheme == 'https'
-        try:
-            domain_info = whois.whois(hostname)
-            details['domain_creation_date'] = domain_info.creation_date
-        except Exception:
-            details['domain_creation_date'] = None
-        if details['uses_https']:
-            details['ssl_info'] = get_ssl_certificate_info(hostname)
+        if not hostname:
+            return 0, ["❌ **Invalid URL:** Could not parse a valid hostname."]
+    except Exception:
+        return 0, ["❌ **Invalid URL:** Could not be parsed."]
+
+    domain_age = get_domain_age_days(hostname)
+    if domain_age is not None:
+        if domain_age < 90:
+            report.append(f"🚨 **High Risk:** Domain is very new ({domain_age} days old).")
+            score += 30
+        elif domain_age < 365:
+            report.append(f"⚠️ **Suspicious:** Domain is less than a year old ({domain_age} days).")
+            score += 15
         else:
-            details['ssl_info'] = {"error": "Site does not use HTTPS."}
-        return details
-    except Exception as e:
-        return {"error": str(e)}
+            report.append(f"✅ **OK:** Domain is well-established ({domain_age} days old).")
+            score -= 10
 
-def calculate_risk_score(details):
-    """Calculates a weighted risk score including the intelligent typosquatting check."""
-    score, factors = 0, []
-    hostname = details.get('hostname', '')
-    typo_result = check_typosquatting(hostname)
-    if "Warning" in typo_result:
-        score += 40
-        factors.append("High-risk typosquatting pattern detected (+40)")
-
-    creation_date = details.get('domain_creation_date')
-    if creation_date:
-        if isinstance(creation_date, list): creation_date = creation_date[0]
-        age_days = (datetime.now() - creation_date).days
-        if age_days < 180:
-            score += 25; factors.append(f"Domain is very new ({age_days} days old) (+25)")
-        elif age_days > 730:
-            score -= 15; factors.append("Domain is well-established (>2 years old) (-15)")
-
-    ssl_info = details.get('ssl_info', {})
-    if not ssl_info.get("error"):
-        ssl_age_days = (datetime.now() - ssl_info['valid_from']).days
-        if ssl_age_days < 90:
-            score += 15; factors.append(f"SSL certificate is new ({ssl_age_days} days old) (+15)")
+    if parsed_url.scheme != 'https':
+        report.append("🚨 **High Risk:** Site does not use HTTPS.")
+        score += 20
     else:
-        score += 10; factors.append("Site does not use HTTPS or SSL cert is invalid (+10)")
+        report.append("✅ **OK:** Site uses HTTPS.")
 
-    if '@' in details['url']:
-        score += 20; factors.append("URL contains '@' symbol (+20)")
+    suspicious_keywords = ['login', 'verify', 'account', 'update', 'secure', 'signin', 'banking', 'confirm', 'password']
+    if any(kw in final_url.lower() for kw in suspicious_keywords):
+        report.append("⚠️ **Suspicious:** URL contains keywords often used in phishing.")
+        score += 15
+    
+    if hostname.count('.') > 3:
+        report.append("⚠️ **Suspicious:** URL has an excessive number of subdomains.")
+        score += 10
+
+    brands = ["microsoft", "google", "apple", "paypal", "amazon", "facebook", "netflix", "chase"]
+    for brand in brands:
+        if brand in hostname and not hostname.endswith(f".{brand}.com"):
+            report.append(f"🚨 **High Risk:** Potential brand impersonation of '{brand}' in the domain.")
+            score += 40
+            break
 
     final_score = max(0, min(100, score))
-    return final_score, factors, typo_result
+    return final_score, report
 
-# --- UI-SPECIFIC FUNCTIONS ---
-PORT_SERVICE_MAP = { 80: "HTTP", 443: "HTTPS", 21: "FTP", 22: "SSH" }
-def port_scan(target, port_range):
-    open_ports, closed_ports, error_msg = [], [], None
-    try:
-        target_ip = socket.gethostbyname(target)
-        def scan_port(port):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(0.5)
-                if s.connect_ex((target_ip, port)) == 0: open_ports.append(port)
-                else: closed_ports.append(port)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-            executor.map(scan_port, range(port_range[0], port_range[1] + 1))
-    except socket.gaierror:
-        error_msg = f"Error: Could not resolve domain '{target}'."
-    return sorted(open_ports), sorted(closed_ports), error_msg
-def discover_paths(url): return [f"{url}/", f"{url}/assets/"]
+def analyze_text(text):
+    """Analyzes a block of text for phishing indicators based on content and structure."""
+    report = []
+    score = 0
+    
+    keyword_sets = {
+        "Urgency/Threat": ['urgent', 'action required', 'suspended', 'limited time', 'verify immediately'],
+        "Financial/Prize": ['winner', 'claim', 'prize', 'free gift', 'invoice', 'payment'],
+    }
+    for category, keywords in keyword_sets.items():
+        found = [kw for kw in keywords if kw in text.lower()]
+        if found:
+            report.append(f"⚠️ **{category} Keywords:** Found suspicious words: `{', '.join(found)}`.")
+            score += 20
 
-# --- Streamlit App UI ---
-st.set_page_config(layout="centered", page_title="Phishing Detector")
-st.title("🛡️ Phishing Website Detector, Port & Text Scanner")
-st.markdown("Analyze a website, suspicious text, or message for phishing risk!")
+    sender_pattern = re.search(r'from:\s*".*?"\s*<(.+?)>', text.lower())
+    if sender_pattern:
+        sender_email = sender_pattern.group(1)
+        brands = ["paypal", "microsoft", "bank", "apple", "google"]
+        for brand in brands:
+            if brand in text.lower()[:text.lower().find(sender_email)] and brand not in sender_email:
+                report.append(f"🚨 **High Risk:** Potential sender spoofing detected.")
+                score += 35
+                break
 
-tab1, tab2, tab3 = st.tabs(["Website/Domain Analysis", "Text/Message Analysis", "Phishing Self-Test"])
+    words = text.split()
+    if len(words) > 10:
+        num_caps = sum(1 for word in words if word.isupper() and len(word) > 2)
+        if (num_caps / len(words)) > 0.1:
+            report.append("⚠️ **Suspicious Structure:** Message contains excessive capitalization.")
+            score += 10
+
+    links = list(set(re.findall(r'https?://[^\s/$.?#].[^\s]*', text)))
+    if links:
+        report.append(f"✅ **Links Found:** Analyzing {len(links)} unique URL(s)...")
+        highest_link_score = 0
+        for link in links:
+            link_score, _ = analyze_url(link)
+            if link_score > highest_link_score:
+                highest_link_score = link_score
+        
+        if highest_link_score > 0:
+            report.append(f"🚨 **High Risk Link Detected:** At least one link was flagged as high risk (score: {highest_link_score}).")
+            score += highest_link_score
+    else:
+        report.append("✅ **No Links Found:** No URLs were detected in the text.")
+
+    final_score = max(0, min(100, score))
+    return final_score, report
+
+# --- STREAMLIT UI ---
+st.set_page_config(layout="wide", page_title="Phishing Detector Pro")
+st.title("🛡️ Phishing Detector Pro")
+st.markdown("A robust, file-based tool to detect phishing risks in URLs and text messages.")
+
+load_local_threat_db()
+
+tab1, tab2, tab3 = st.tabs(["URL Analysis", "Text/Message Analysis", "Methodology"])
 
 with tab1:
-    st.header("Website Analysis")
-    url_to_analyze = st.text_input("Enter URL to analyze:", "https://micr0s0ft.com")
-    perform_scan = st.checkbox("Perform Port Scan (for open ports)", value=False)
-    if perform_scan:
-        col1, col2 = st.columns(2)
-        port_start, port_end = col1.number_input("Start Port", 1, 65535, 1), col2.number_input("End Port", 1, 65535, 1024)
-
-    if st.button("Analyze Website"):
-        with st.spinner(f"Performing deep analysis of {url_to_analyze}..."):
-            tech_details = get_technical_details(url_to_analyze)
-            risk_score, risk_factors, typo_result = calculate_risk_score(tech_details)
-            paths = discover_paths(url_to_analyze.strip('/'))
-
-            open_ports, closed_ports, port_error = (None, None, None)
-            if perform_scan:
-                open_ports, closed_ports, port_error = port_scan(tech_details.get('hostname'), (port_start, port_end))
-
-            st.subheader("Analysis Results")
-            col1, col2 = st.columns(2)
-            col1.metric("Risk Score", f"{risk_score}/100")
-
-            with col2:
-                st.write("**Prediction**")
-                if risk_score > 60: color, text = "#dc3545", "High Risk / Phishing"
-                elif risk_score > 30: color, text = "#ffc107", "Potentially Suspicious"
-                else: color, text = "#28a745", "Potentially Safe"
-                st.markdown(f"""<div style="display: flex; align-items: center; gap: 8px;"><div style="width: 15px; height: 15px; background-color: {color}; border-radius: 50%;"></div><span style="color: {color}; font-weight: bold;">{text}</span></div>""", unsafe_allow_html=True)
-
-            with st.expander("Show Risk Factors", expanded=True):
-                if not risk_factors: st.markdown("- No significant risk factors detected.")
-                for factor in risk_factors:
-                    if "(-" in factor: st.markdown(f"<p style='color:green;'>✓ {factor}</p>", unsafe_allow_html=True)
-                    else: st.markdown(f"<p style='color:orange;'>⚠️ {factor}</p>", unsafe_allow_html=True)
-
-            st.markdown("---")
-            st.subheader("SSL/TLS Certificate Transparency")
-            ssl_info = tech_details.get('ssl_info', {})
-            if ssl_info.get("error"): st.error(ssl_info["error"])
-            else:
-                st.info(f"**Issuer:** {ssl_info.get('issuer', 'N/A')}")
-                st.write(f"**Valid from:** {ssl_info.get('valid_from')} | **To:** {ssl_info.get('valid_to')}")
-                age_days = (datetime.now() - ssl_info['valid_from']).days
-                st.write(f"**Certificate age:** {age_days} days")
-                if age_days < 90: st.warning("⚠️ Certificate is very new (issued in the last 90 days).")
-            
-            st.subheader("Typosquatting & Lookalike Domain Check")
-            if "Warning" in typo_result: st.warning(typo_result)
-            else: st.success(typo_result)
-            
-            # Other sections of the UI
-            if perform_scan:
-                st.subheader(f"Port Scan Results ({port_start}–{port_end})")
-                if port_error: st.error(port_error)
-                if open_ports:
-                    st.markdown("**Open Ports:**")
-                    for port in open_ports: st.markdown(f"&nbsp;&nbsp;• Port {port}: <span style='color:green;font-weight:bold;'>OPEN</span> ({PORT_SERVICE_MAP.get(port, '')})", unsafe_allow_html=True)
-
-# --- TAB 2: TEXT/MESSAGE ANALYSIS ---
-with tab2:
-    st.header("Text & Message Analysis")
-    text_to_analyze = st.text_area("Paste any suspicious email, SMS, or message below:", height=200, key="text_analyzer_input")
-    if st.button("Analyze Text"):
-        if not text_to_analyze:
-            st.warning("Please paste some text to analyze.")
+    st.header("Analyze a Single Website URL")
+    url_input = st.text_input("Enter a full URL to analyze:", "http://paypal.com.security-check.info/login")
+    
+    if st.button("Analyze URL"):
+        if not url_input:
+            st.warning("Please enter a URL.")
         else:
-            with st.spinner("Analyzing text..."):
-                score, issues = 0, []
-                links = re.findall(r'https?://[^\s/$.?#].[^\s]*', text_to_analyze)
-                if links:
-                    score += 25; issues.append(f"Suspicious links found: `{', '.join(links)}`")
-                else:
-                    issues.append("No suspicious links detected.")
+            with st.spinner(f"Performing deep analysis on `{url_input}`..."):
+                score, report = analyze_url(url_input)
+            
+            st.subheader("Analysis Report")
+            if score > 75: level, color = "High Risk / Likely Phishing", "red"
+            elif score > 40: level, color = "Suspicious", "orange"
+            else: level, color = "Likely Safe", "green"
                 
-                keywords = ['urgent', 'verify', 'account', 'suspended', 'password', 'winner', 'claim']
-                found_keywords = [kw for kw in keywords if kw in text_to_analyze.lower()]
-                if found_keywords:
-                    score += 30; issues.append(f"Phishing keywords detected: `{', '.join(found_keywords)}`")
-                else:
-                    issues.append("No common phishing keywords detected.")
-                
-                st.subheader("Text Analysis Results")
-                col1, col2 = st.columns(2)
-                col1.metric("Risk Score", f"{score}/100")
-                if score > 50: col2.error("Prediction: High Risk")
-                elif score > 20: col2.warning("Prediction: Medium Risk")
-                else: col2.success("Prediction: Low Risk")
-                
-                st.subheader("Detected Issues")
-                for issue in issues: st.markdown(f"- {issue}")
+            st.markdown(f"### Overall Risk Score: <span style='color:{color};'>{score}/100 ({level})</span>", unsafe_allow_html=True)
+            with st.expander("Show Detailed Breakdown", expanded=True):
+                for item in report:
+                    st.markdown(f"- {item}")
 
-# --- TAB 3: PHISHING SELF-TEST ---
+with tab2:
+    st.header("Analyze a Suspicious Text or Email")
+    text_input = st.text_area("Paste the full text of the suspicious message below:", height=250, 
+    placeholder="""Example: From: "PayPal Support" <support-team@pp-alerts.xyz>...""")
+    
+    if st.button("Analyze Text"):
+        if not text_input:
+            st.warning("Please enter some text to analyze.")
+        else:
+            with st.spinner("Analyzing text content and embedded links..."):
+                score, report = analyze_text(text_input)
+
+            st.subheader("Text Analysis Report")
+            if score > 75: level, color = "High Risk / Likely Phishing", "red"
+            elif score > 40: level, color = "Suspicious", "orange"
+            else: level, color = "Likely Safe", "green"
+            
+            st.markdown(f"### Overall Risk Score: <span style='color:{color};'>{score}/100 ({level})</span>", unsafe_allow_html=True)
+            with st.expander("Show Detailed Breakdown", expanded=True):
+                for item in report:
+                    st.markdown(f"- {item}")
+
 with tab3:
-    st.header("🎓 Phishing Awareness Self-Test")
-    st.markdown("Test your ability to spot phishing attempts!")
-    with st.form("quiz_form"):
-        st.markdown("**1. You receive an email from 'support@micros0ft.com'. What's the biggest red flag?**")
-        q1 = st.radio("Answer 1", ["The urgent tone", "The sender's email address", "The link inside"], key="q1")
-        st.markdown("**2. A website uses HTTPS. Does this always mean it's safe?**")
-        q2 = st.radio("Answer 2", ["Yes, HTTPS means the site is always safe.", "No, phishing sites can also use HTTPS to appear legitimate."], key="q2")
-        st.markdown("**3. An SMS says you've won a prize and asks you to click a link to 'claim.it/now'. You should:**")
-        q3 = st.radio("Answer 3", ["Click the link to see the prize.", "Ignore and delete the message.", "Reply 'STOP' to unsubscribe."], key="q3")
-        
-        if st.form_submit_button("Submit Quiz"):
-            score = 0
-            if "sender's email address" in q1: score += 1
-            if "No, phishing sites can" in q2: score += 1
-            if "Ignore and delete" in q3: score += 1
-            st.subheader(f"Your Score: {score}/3")
-            if score == 3:
-                st.success("Excellent! You have a sharp eye for phishing attempts."); st.balloons()
-            else:
-                st.warning("Good job, but be sure to review the correct answers to stay safe!")
+    st.header("Analysis Methodology")
+    st.markdown("""
+    This tool uses a multi-layered heuristic analysis approach to determine the risk score of a given URL or text message. It does **not** rely on a single factor but combines several indicators to make a more accurate assessment.
+
+    ### Key Analysis Techniques:
+
+    1.  **File-Based Threat Intelligence:**
+        - The application uses a local JSON file (`local_phishtank_db.json`) as a threat database.
+        - This provides a rapid, offline check for known phishing URLs without hitting API rate limits.
+        - A URL found in this database is immediately flagged as critical risk.
+
+    2.  **Domain Age Analysis (WHOIS Lookup):**
+        - Phishing websites are often hosted on newly registered domains.
+        - The tool performs a `whois` lookup to find the domain's creation date.
+        - Domains created less than 90 days ago are considered high-risk.
+
+    3.  **URL Structural Analysis:**
+        - **Keywords:** Scans for common phishing keywords (e.g., `login`, `secure`, `verify`) in the URL.
+        - **Subdomains:** Checks for an excessive number of subdomains (e.g., `login.microsoft.com.security.net`), a common tactic to confuse users.
+        - **HTTPS:** Verifies that the site uses a secure HTTPS connection. While many phishing sites now use HTTPS, its absence is a major red flag.
+
+    4.  **Brand Impersonation & Typosquatting:**
+        - The tool checks if the domain name contains well-known brand names (like `google`, `paypal`) in a suspicious manner (e.g., `paypal-security.com` instead of `paypal.com`).
+        - This helps catch one of the most common phishing techniques.
+
+    5.  **Text Content Analysis (for messages):**
+        - **Urgency & Threat Keywords:** Scans for words designed to create panic and urgency.
+        - **Sender Spoofing:** Looks for mismatches between the sender's display name and their actual email address.
+        - **Embedded Link Analysis:** Automatically extracts all URLs from the text and performs the full URL analysis on each one. The highest risk score from any link is factored into the overall text score.
+    """)
