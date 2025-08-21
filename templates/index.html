@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phishing Website Detector & Text Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛡️ Phishing Website Detector & Text Scanner</h1>
+            <p>A robust tool to detect phishing risks in URLs and text messages.</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-link active" onclick="openTab(event, 'url-analysis')">URL Analysis</button>
+            <button class="tab-link" onclick="openTab(event, 'text-analysis')">Text/Message Analysis</button>
+        </div>
+
+        <div id="url-analysis" class="tab-content active">
+            <h2>Analyze a Single Website URL</h2>
+            <form id="url-form">
+                <input type="text" id="url-input" placeholder="Enter a full URL to analyze..." required>
+                <button type="submit">Analyze URL</button>
+            </form>
+        </div>
+
+        <div id="text-analysis" class="tab-content">
+            <h2>Analyze a Suspicious Text or Email</h2>
+            <form id="text-form">
+                <textarea id="text-input" rows="8" placeholder="Paste the full text of the suspicious message here..." required></textarea>
+                <button type="submit">Analyze Text</button>
+            </form>
+        </div>
+
+        <div id="results-container" class="hidden">
+            <h2>Analysis Report</h2>
+            <div id="score-card"></div>
+            <div id="report-details"></div>
+        </div>
+        
+        <div id="loader" class="hidden">
+            <div class="spinner"></div>
+            <p>Performing deep analysis...</p>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
