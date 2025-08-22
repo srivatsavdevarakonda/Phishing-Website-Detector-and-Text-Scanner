@@ -16,7 +16,7 @@
 
 ## 🚀 Live Demo
 
-> 🔗 **[https://phishing-website-detector-and-text.onrender.com](phishing-website-detector-and-text-scanner)**
+> 🔗 **[phishing-website-detector-and-text-scanner](https://phishing-website-detector-and-text.onrender.com)**
 
 ---
 
